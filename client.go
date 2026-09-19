@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -57,6 +58,8 @@ type clientConfig struct {
 	eventHandler        EventHandler
 	paddingSize         int
 	cacheStrategy       CacheStrategy
+	basicEd25519Seed    []byte
+	stableSignerSet     bool
 	credentialWithKey   *credentials.CredentialWithKey
 	sigKey              *ciphersuite.SignaturePrivateKey
 	logger              *slog.Logger
@@ -97,6 +100,19 @@ func WithPaddingSize(n int) ClientOption {
 			n = 0
 		}
 		cfg.paddingSize = n
+	}
+}
+
+// WithBasicEd25519Seed uses a caller-managed, durable seed for the basic
+// credential's Ed25519 signing key. The caller must protect the seed and bind
+// it to one identity. Without this option, NewClient generates a new key.
+func WithBasicEd25519Seed(seed []byte) ClientOption {
+	return func(cfg *clientConfig) {
+		if cfg == nil {
+			return
+		}
+		cfg.basicEd25519Seed = append([]byte(nil), seed...)
+		cfg.stableSignerSet = true
 	}
 }
 
@@ -458,7 +474,29 @@ func NewClient(identity []byte, cs ciphersuite.CipherSuite, opts ...ClientOption
 		sigKey      *ciphersuite.SignaturePrivateKey
 		err         error
 	)
-	if cfg.credentialWithKey != nil {
+	if cfg.stableSignerSet {
+		defer clear(cfg.basicEd25519Seed)
+		if cfg.credentialWithKey != nil {
+			return nil, fmt.Errorf("basic Ed25519 and X.509 credentials are mutually exclusive")
+		}
+		if cs.SignatureScheme() != ciphersuite.ED25519 {
+			return nil, fmt.Errorf("basic Ed25519 credentials require an Ed25519 cipher suite")
+		}
+		if len(identity) == 0 {
+			return nil, ErrEmptyIdentity
+		}
+		if len(cfg.basicEd25519Seed) != ed25519.SeedSize {
+			return nil, fmt.Errorf("basic Ed25519 seed must be %d bytes", ed25519.SeedSize)
+		}
+		privateKey := ed25519.NewKeyFromSeed(cfg.basicEd25519Seed)
+		publicKey := privateKey.Public().(ed25519.PublicKey)
+		credWithKey = &credentials.CredentialWithKey{
+			Credential:        credentials.NewBasicCredential(append([]byte(nil), identity...)),
+			Ed25519PrivateKey: privateKey,
+			SignatureKeyBytes: append([]byte(nil), publicKey...),
+		}
+		sigKey = ciphersuite.NewEd25519SignaturePrivateKey(privateKey)
+	} else if cfg.credentialWithKey != nil {
 		if cs.SignatureScheme() != ciphersuite.ECDSA_SECP256R1_SHA256 {
 			return nil, fmt.Errorf("X.509 credentials require an ECDSA P-256 cipher suite")
 		}
