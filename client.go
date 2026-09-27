@@ -19,6 +19,7 @@ import (
 	"github.com/thomas-vilte/mls-go/framing"
 	"github.com/thomas-vilte/mls-go/group"
 	"github.com/thomas-vilte/mls-go/keypackages"
+	"github.com/thomas-vilte/mls-go/secrettree"
 	filestore "github.com/thomas-vilte/mls-go/storage/file"
 	memorystore "github.com/thomas-vilte/mls-go/storage/memory"
 	"github.com/thomas-vilte/mls-go/treesync"
@@ -57,6 +58,7 @@ type clientConfig struct {
 	credentialValidator group.CredentialValidator
 	eventHandler        EventHandler
 	paddingSize         int
+	senderRatchet       secrettree.SenderRatchetConfig
 	cacheStrategy       CacheStrategy
 	basicEd25519Seed    []byte
 	stableSignerSet     bool
@@ -142,6 +144,21 @@ const (
 	// CacheAlways keeps loaded group state in memory after the first load.
 	CacheAlways
 )
+
+// WithSenderRatchetConfig bounds out-of-order tolerance for received
+// application and handshake PrivateMessages (RFC 9420 §9.2): how many skipped
+// generations per sender keep their key/nonce, how far a single message may
+// ratchet a sender forward, and how long retained keys live. Retained keys are
+// persisted with the group state so the window survives CacheNone reloads.
+// The zero value selects the secrettree defaults.
+func WithSenderRatchetConfig(cfg secrettree.SenderRatchetConfig) ClientOption {
+	return func(c *clientConfig) {
+		if c == nil {
+			return
+		}
+		c.senderRatchet = cfg
+	}
+}
 
 // WithCacheStrategy sets the in-memory caching strategy for group state.
 func WithCacheStrategy(s CacheStrategy) ClientOption {
@@ -425,6 +442,7 @@ type Client struct {
 	credentialHandlers *CredentialHandlerRegistry
 	proposalPolicies   *ProposalPolicyRegistry
 	paddingSize        int
+	senderRatchet      secrettree.SenderRatchetConfig
 	cacheStrategy      CacheStrategy
 
 	events EventHandler
@@ -535,6 +553,7 @@ func NewClient(identity []byte, cs ciphersuite.CipherSuite, opts ...ClientOption
 		proposalPolicies:   cfg.proposalPolicies,
 		events:             cfg.eventHandler,
 		paddingSize:        cfg.paddingSize,
+		senderRatchet:      cfg.senderRatchet,
 		cacheStrategy:      cfg.cacheStrategy,
 		logger:             logger,
 		pendingKPs:         make(map[string]*pendingEntry),
@@ -604,7 +623,7 @@ func (c *Client) CreateGroup(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating group: %w", err)
 	}
-	g.SetPaddingSize(c.paddingSize)
+	c.configureGroup(g)
 	entry := &groupEntry{}
 	if err := c.persistGroup(ctx, g, entry); err != nil {
 		return nil, err
@@ -642,7 +661,7 @@ func (c *Client) CreateGroupWithExtensions(ctx context.Context, groupIDBytes, ke
 	if err != nil {
 		return nil, fmt.Errorf("creating group with extensions: %w", err)
 	}
-	g.SetPaddingSize(c.paddingSize)
+	c.configureGroup(g)
 	entry := &groupEntry{}
 	if err := c.persistGroup(ctx, g, entry); err != nil {
 		return nil, err
@@ -774,7 +793,7 @@ func (c *Client) JoinGroup(ctx context.Context, welcomeBytes []byte) ([]byte, er
 			joinMatchErr = err
 			continue
 		}
-		g.SetPaddingSize(c.paddingSize)
+		c.configureGroup(g)
 		joinedGroup = g
 		matchKey = key
 		break
@@ -995,6 +1014,7 @@ func (c *Client) ProcessCommit(ctx context.Context, groupID, commitBytes []byte)
 			SenderDataSecret: g.EpochSecrets().SenderDataSecret,
 			SecretTree:       g.SecretTree(),
 			GroupContext:     g.GroupContext().Marshal(),
+			SenderRatchet:    g.SenderRatchetConfig(),
 		})
 		if err != nil {
 			c.log(slog.LevelWarn, "processing private commit failed: decrypt error", "group", groupHex(groupID), "error", err)
@@ -1566,7 +1586,7 @@ func (c *Client) ExternalJoin(ctx context.Context, groupInfoBytes []byte) (group
 	if err := c.validateGroupMembers(ctx, g); err != nil {
 		return nil, nil, err
 	}
-	g.SetPaddingSize(c.paddingSize)
+	c.configureGroup(g)
 	entry := &groupEntry{}
 	if err := c.persistGroup(ctx, g, entry); err != nil {
 		return nil, nil, err
@@ -1619,7 +1639,7 @@ func (c *Client) loadGroupEntry(ctx context.Context, groupIDBytes []byte, entry 
 		return nil, ErrEmptyGroupID
 	}
 	if c.cacheStrategy == CacheAlways && entry.group != nil {
-		entry.group.SetPaddingSize(c.paddingSize)
+		c.configureGroup(entry.group)
 		return entry.group, nil
 	}
 	groupID := group.NewGroupID(cloneBytes(groupIDBytes))
@@ -1634,11 +1654,18 @@ func (c *Client) loadGroupEntry(ctx context.Context, groupIDBytes []byte, entry 
 	if err != nil {
 		return nil, fmt.Errorf("unmarshaling group state: %w", err)
 	}
-	g.SetPaddingSize(c.paddingSize)
+	c.configureGroup(g)
 	if c.cacheStrategy == CacheAlways {
 		entry.group = g
 	}
 	return g, nil
+}
+
+// configureGroup applies client-wide per-group settings to a created or
+// loaded group.
+func (c *Client) configureGroup(g *group.Group) {
+	g.SetPaddingSize(c.paddingSize)
+	g.SetSenderRatchetConfig(c.senderRatchet)
 }
 
 // persistGroup marshals and saves group state, and updates the in-memory cache.

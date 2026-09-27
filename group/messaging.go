@@ -200,6 +200,7 @@ func (g *Group) ReceiveMessage(
 		SecretTree:       g.secretTree,
 		SigPubKey:        sigPubKey,
 		GroupContext:     g.groupContext.Marshal(),
+		SenderRatchet:    g.senderRatchet,
 	})
 	if err != nil {
 		return nil, &ErrDecryptionFailed{Reason: "message", Err: err}
@@ -266,11 +267,15 @@ func (g *Group) ReceiveApplicationMessage(pm *framing.PrivateMessage) (plaintext
 		}
 	}
 
+	// Drop retained out-of-order keys that aged out or fell behind the window
+	// for every sender, not only the one this message comes from.
+	secretTree.PurgeExpiredRetainedKeys(g.senderRatchet)
 	ac, decErr := framing.Decrypt(pm, framing.DecryptParams{
 		CipherSuite:      cs,
 		SenderDataSecret: senderDataSecret,
 		SecretTree:       secretTree,
 		GroupContext:     groupContextBytes,
+		SenderRatchet:    g.senderRatchet,
 	})
 	if decErr != nil {
 		return nil, nil, 0, &ErrDecryptionFailed{Reason: "message", Err: decErr}

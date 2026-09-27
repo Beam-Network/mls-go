@@ -17,6 +17,7 @@ package secrettree
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/thomas-vilte/mls-go/ciphersuite"
 	"github.com/thomas-vilte/mls-go/internal/tls"
@@ -70,13 +71,10 @@ type Tree struct {
 //
 // The ratchet advances forward-only (generation increases monotonically).
 // To move to generation G, call ratchetTo(G) or use Advance() for sequential steps.
-// cachedGenSecret holds the ratchet secrets for a past generation to support
-// out-of-order message decryption (RFC 9420 §9.2).
-type cachedGenSecret struct {
-	application *ciphersuite.Secret
-	handshake   *ciphersuite.Secret
-}
-
+// Received messages go through DecryptionKeyNonce/ConsumeGeneration, which
+// retain the key/nonce pairs of skipped generations for bounded out-of-order
+// delivery (RFC 9420 §9.2); see retention.go.
+//
 // LeafState holds the serializable per-leaf ratchet state.
 type LeafState struct {
 	Generation        uint64 `json:"generation"`
@@ -84,6 +82,10 @@ type LeafState struct {
 	LeafSecret        []byte `json:"leaf_secret"`
 	ApplicationSecret []byte `json:"application_secret"`
 	HandshakeSecret   []byte `json:"handshake_secret"`
+	// RetainedKeys holds unconsumed key/nonce pairs of skipped generations so
+	// that out-of-order delivery survives a persist/restore cycle. Ratchet
+	// secrets of past generations are never persisted.
+	RetainedKeys []RetainedKeyState `json:"retained_keys,omitempty"`
 }
 
 // TreeState holds the full serializable state of a Tree, including per-leaf ratchet
@@ -96,10 +98,6 @@ type TreeState struct {
 	LeafStates       map[uint32]LeafState `json:"leaf_states,omitempty"`
 }
 
-// maxCachedGenerations is the maximum number of past generations to retain
-// for out-of-order delivery. RFC 9420 §9.2 leaves this as a local decision.
-const maxCachedGenerations = 2048
-
 // LeafSecret tracks the per-leaf secret ratchets used for message protection.
 type LeafSecret struct {
 	cs                       ciphersuite.CipherSuite
@@ -109,15 +107,11 @@ type LeafSecret struct {
 	handshakeRatchetSecret   *ciphersuite.Secret
 	applicationRatchetSecret *ciphersuite.Secret
 	sequenceNumber           uint64 // message counter (separate from ratchet generation)
-	// secretCache retains ratchet secrets for past generations to support
-	// out-of-order decryption. Entries are evicted when the cache exceeds
-	// maxCachedGenerations to bound memory usage.
-	secretCache map[uint32]*cachedGenSecret
-	// usedApplicationGenerations / usedHandshakeGenerations track which generations
-	// have already been decrypted per ratchet type. RFC 9420 §9.2 requires replay
-	// protection, and the two ratchets are independent (each starts at generation 0),
-	// so they must be tracked separately to avoid false replay errors when e.g. a
-	// handshake message and an application message both use generation 0.
+	// retained holds the unconsumed key/nonce pairs of skipped generations,
+	// bounded by SenderRatchetConfig (RFC 9420 §9.2 out-of-order tolerance).
+	retained map[retainedID]*retainedKey
+	// usedApplicationGenerations / usedHandshakeGenerations back the deprecated
+	// MarkGenerationUsed API. Replay protection is enforced by ConsumeGeneration.
 	usedApplicationGenerations map[uint32]struct{}
 	usedHandshakeGenerations   map[uint32]struct{}
 }
@@ -229,8 +223,9 @@ func (t *Tree) LeafForIndex(leafIndex uint32) (*LeafSecret, error) {
 }
 
 // MarshalFull exports the full persisted state of the secret tree, including
-// initialized per-leaf ratchet state. Past-generation caches are intentionally
-// excluded to preserve forward secrecy.
+// initialized per-leaf ratchet state and the retained key/nonce pairs of
+// skipped generations (bounded by SenderRatchetConfig). Ratchet secrets of
+// past generations are never exported.
 func (t *Tree) MarshalFull() *TreeState {
 	if t == nil {
 		return nil
@@ -253,6 +248,7 @@ func (t *Tree) MarshalFull() *TreeState {
 			LeafSecret:        cloneSecretBytes(leaf.leafSecret),
 			ApplicationSecret: cloneSecretBytes(leaf.applicationRatchetSecret),
 			HandshakeSecret:   cloneSecretBytes(leaf.handshakeRatchetSecret),
+			RetainedKeys:      leaf.marshalRetained(),
 		}
 	}
 
@@ -339,47 +335,55 @@ func prevPow2(n uint32) uint32 {
 // This is a no-op if already at the target generation.
 func (ls *LeafSecret) ratchetTo(gen uint32) error {
 	if uint64(gen) < ls.generation {
-		// Past generation: must be in the cache for out-of-order decryption.
-		if _, ok := ls.secretCache[gen]; ok {
-			return nil // cached — key derivation will use secretCache[gen]
+		// Past generation: only retained (skipped, unconsumed) keys remain.
+		if _, ok := ls.retained[retainedID{generation: gen}]; ok {
+			return nil
 		}
-		return fmt.Errorf("generation %d already advanced past (current: %d)", gen, ls.generation)
+		if _, ok := ls.retained[retainedID{generation: gen, handshake: true}]; ok {
+			return nil
+		}
+		return ls.generationError(gen, false, ErrGenerationConsumed)
 	}
-	nh := ls.cs.HashLength()
+	// Sender-side / legacy stepping never retains skipped keys; receivers use
+	// DecryptionKeyNonce, which applies the out-of-order window.
 	for ls.generation < uint64(gen) {
-		g := uint32(ls.generation)
-		genBytes := uint32ToBytes(g)
-
-		next, err := ls.applicationRatchetSecret.KdfExpandLabel("secret", genBytes, nh)
-		if err != nil {
-			return fmt.Errorf("advance application ratchet (gen %d): %w", g, err)
+		if err := ls.stepRatchets(false, time.Time{}); err != nil {
+			return err
 		}
-		nextHs, err := ls.handshakeRatchetSecret.KdfExpandLabel("secret", genBytes, nh)
-		if err != nil {
-			next.SecureZero()
-			return fmt.Errorf("advance handshake ratchet (gen %d): %w", g, err)
-		}
-
-		// Cache secrets at generation g before advancing, for out-of-order delivery.
-		if ls.secretCache == nil {
-			ls.secretCache = make(map[uint32]*cachedGenSecret)
-		}
-		if len(ls.secretCache) < maxCachedGenerations {
-			// Clone secrets before zeroing so cache holds the gen-g value.
-			ls.secretCache[g] = &cachedGenSecret{
-				application: ls.applicationRatchetSecret.Clone(),
-				handshake:   ls.handshakeRatchetSecret.Clone(),
-			}
-		}
-
-		ls.applicationRatchetSecret.SecureZero() // RFC §9.2: delete consumed secret
-		ls.applicationRatchetSecret = next
-		ls.handshakeRatchetSecret.SecureZero() // RFC §9.2: delete consumed secret
-		ls.handshakeRatchetSecret = nextHs
-
-		ls.generation++
 	}
 	return nil
+}
+
+// derive returns the key or nonce for generation on one ratchet. Past
+// generations are served from retained keys only (without consuming them).
+func (ls *LeafSecret) derive(generation uint32, handshake, wantNonce bool) ([]byte, error) {
+	if uint64(generation) < ls.generation {
+		rk, ok := ls.retained[retainedID{generation: generation, handshake: handshake}]
+		if !ok {
+			reason := ErrGenerationConsumed
+			if ls.generation-uint64(generation) > uint64(DefaultOutOfOrderTolerance) {
+				reason = ErrGenerationTooOld
+			}
+			return nil, ls.generationError(generation, handshake, reason)
+		}
+		if wantNonce {
+			return cloneBytes(rk.nonce), nil
+		}
+		return cloneBytes(rk.key), nil
+	}
+	if err := ls.ratchetTo(generation); err != nil {
+		return nil, err
+	}
+	key, nonce, err := ls.headKeyNonce(handshake)
+	if err != nil {
+		return nil, err
+	}
+	if wantNonce {
+		clear(key)
+		return nonce, nil
+	}
+	clear(nonce)
+	return key, nil
 }
 
 // Advance ratchets both secrets (handshake and application) one step forward,
@@ -424,22 +428,11 @@ func (ls *LeafSecret) CurrentGeneration() uint32 {
 //
 // Returns the 16-byte application encryption key, or an error if derivation fails.
 func (ls *LeafSecret) ApplicationKey(generation uint32) ([]byte, error) {
-	if err := ls.ratchetTo(generation); err != nil {
-		return nil, err
-	}
-	secret := ls.applicationRatchetSecret
-	if uint64(generation) < ls.generation {
-		if cached, ok := ls.secretCache[generation]; ok {
-			secret = cached.application
-		} else {
-			return nil, fmt.Errorf("application key for generation %d not in cache", generation)
-		}
-	}
-	key, err := secret.KdfExpandLabel("key", uint32ToBytes(generation), ls.cs.AeadKeyLength())
+	out, err := ls.derive(generation, false, false)
 	if err != nil {
 		return nil, fmt.Errorf("deriving application key: %w", err)
 	}
-	return key.AsSlice(), nil
+	return out, nil
 }
 
 // ApplicationNonce derives the application content nonce for generation gen.
@@ -458,22 +451,11 @@ func (ls *LeafSecret) ApplicationKey(generation uint32) ([]byte, error) {
 //
 // Returns the 12-byte nonce for AES-GCM encryption, or an error if derivation fails.
 func (ls *LeafSecret) ApplicationNonce(generation uint32) ([]byte, error) {
-	if err := ls.ratchetTo(generation); err != nil {
-		return nil, err
-	}
-	secret := ls.applicationRatchetSecret
-	if uint64(generation) < ls.generation {
-		if cached, ok := ls.secretCache[generation]; ok {
-			secret = cached.application
-		} else {
-			return nil, fmt.Errorf("application nonce for generation %d not in cache", generation)
-		}
-	}
-	nonce, err := secret.KdfExpandLabel("nonce", uint32ToBytes(generation), ls.cs.AeadNonceLength())
+	out, err := ls.derive(generation, false, true)
 	if err != nil {
 		return nil, fmt.Errorf("deriving application nonce: %w", err)
 	}
-	return nonce.AsSlice(), nil
+	return out, nil
 }
 
 // HandshakeKey derives the handshake content key for generation gen.
@@ -496,22 +478,11 @@ func (ls *LeafSecret) ApplicationNonce(generation uint32) ([]byte, error) {
 //
 // Returns the 16-byte handshake encryption key, or an error if derivation fails.
 func (ls *LeafSecret) HandshakeKey(generation uint32) ([]byte, error) {
-	if err := ls.ratchetTo(generation); err != nil {
-		return nil, err
-	}
-	secret := ls.handshakeRatchetSecret
-	if uint64(generation) < ls.generation {
-		if cached, ok := ls.secretCache[generation]; ok {
-			secret = cached.handshake
-		} else {
-			return nil, fmt.Errorf("handshake key for generation %d not in cache", generation)
-		}
-	}
-	key, err := secret.KdfExpandLabel("key", uint32ToBytes(generation), ls.cs.AeadKeyLength())
+	out, err := ls.derive(generation, true, false)
 	if err != nil {
 		return nil, fmt.Errorf("deriving handshake key: %w", err)
 	}
-	return key.AsSlice(), nil
+	return out, nil
 }
 
 // HandshakeNonce derives the handshake content nonce for generation gen.
@@ -530,22 +501,11 @@ func (ls *LeafSecret) HandshakeKey(generation uint32) ([]byte, error) {
 //
 // Returns the 12-byte nonce for handshake message encryption, or an error if derivation fails.
 func (ls *LeafSecret) HandshakeNonce(generation uint32) ([]byte, error) {
-	if err := ls.ratchetTo(generation); err != nil {
-		return nil, err
-	}
-	secret := ls.handshakeRatchetSecret
-	if uint64(generation) < ls.generation {
-		if cached, ok := ls.secretCache[generation]; ok {
-			secret = cached.handshake
-		} else {
-			return nil, fmt.Errorf("handshake nonce for generation %d not in cache", generation)
-		}
-	}
-	nonce, err := secret.KdfExpandLabel("nonce", uint32ToBytes(generation), ls.cs.AeadNonceLength())
+	out, err := ls.derive(generation, true, true)
 	if err != nil {
 		return nil, fmt.Errorf("deriving handshake nonce: %w", err)
 	}
-	return nonce.AsSlice(), nil
+	return out, nil
 }
 
 // EncryptionKey derives a content encryption key for generation seqNum using
@@ -604,6 +564,10 @@ func (ls *LeafSecret) NextSequenceNumber() uint64 {
 // RFC 9420 §9.2: receivers MUST NOT accept a message with a generation that was
 // already processed. The two ratchets are independent, so their replay windows
 // are tracked separately.
+//
+// Deprecated: replay protection is enforced by ConsumeGeneration, which deletes
+// the consumed key material and survives persistence. This in-memory set is
+// kept for API compatibility only.
 func (ls *LeafSecret) MarkGenerationUsed(gen uint32, handshake bool) error {
 	if handshake {
 		if ls.usedHandshakeGenerations == nil {
@@ -624,6 +588,9 @@ func (ls *LeafSecret) MarkGenerationUsed(gen uint32, handshake bool) error {
 	}
 	return nil
 }
+
+// SequenceNumber returns the next send sequence number without incrementing it.
+func (ls *LeafSecret) SequenceNumber() uint64 { return ls.sequenceNumber }
 
 // SetSequenceNumber sets the sequence number.
 func (ls *LeafSecret) SetSequenceNumber(seq uint64) {
@@ -655,15 +622,7 @@ func (ls *LeafSecret) DeleteLeaf() {
 		ls.applicationRatchetSecret.SecureZero()
 		ls.applicationRatchetSecret = nil
 	}
-	for _, cached := range ls.secretCache {
-		if cached.application != nil {
-			cached.application.SecureZero()
-		}
-		if cached.handshake != nil {
-			cached.handshake.SecureZero()
-		}
-	}
-	ls.secretCache = nil
+	ls.dropRetained()
 	ls.sequenceNumber = 0
 }
 
@@ -715,15 +674,24 @@ func (ls *LeafSecret) Encrypt(plaintext []byte, aad []byte, seqNum uint64) ([]by
 //
 //nolint:gocritic // Keep separate []byte parameters for clarity
 func (ls *LeafSecret) Decrypt(ciphertext []byte, aad []byte, seqNum uint64) ([]byte, error) {
-	key, err := ls.ApplicationKey(uint32(seqNum))
-	if err != nil {
-		return nil, fmt.Errorf("getting encryption key: %w", err)
+	if seqNum > maxAEADSequence {
+		return nil, fmt.Errorf("generation %d out of range", seqNum)
 	}
-	nonce, err := ls.ApplicationNonce(uint32(seqNum))
+	gen := uint32(seqNum)
+	key, nonce, err := ls.DecryptionKeyNonce(gen, false, SenderRatchetConfig{})
 	if err != nil {
-		return nil, fmt.Errorf("getting nonce: %w", err)
+		return nil, fmt.Errorf("getting decryption key: %w", err)
 	}
-	return ciphersuite.DecryptWithCipherSuite(key, nonce, ciphertext, aad, ls.cs)
+	plaintext, err := ciphersuite.DecryptWithCipherSuite(key, nonce, ciphertext, aad, ls.cs)
+	clear(key)
+	clear(nonce)
+	if err != nil {
+		return nil, err
+	}
+	if err := ls.ConsumeGeneration(gen, false); err != nil {
+		return nil, err
+	}
+	return plaintext, nil
 }
 
 // Helper functions
@@ -819,7 +787,9 @@ func UnmarshalFull(state *TreeState, cs ciphersuite.CipherSuite) (*Tree, error) 
 			handshakeRatchetSecret:   ciphersuite.NewSecret(leafState.HandshakeSecret),
 			applicationRatchetSecret: ciphersuite.NewSecret(leafState.ApplicationSecret),
 			sequenceNumber:           leafState.SequenceNumber,
-			secretCache:              make(map[uint32]*cachedGenSecret),
+		}
+		if err := leaf.unmarshalRetained(leafState.RetainedKeys); err != nil {
+			return nil, fmt.Errorf("leaf %d: %w", leafIndex, err)
 		}
 		tree.leafCache[leafIndex] = leaf
 	}
