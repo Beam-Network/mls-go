@@ -285,6 +285,9 @@ type DecryptParams struct {
 	// If nil, verification is skipped (not recommended in production).
 	SigPubKey    *ciphersuite.MLSSignaturePublicKey
 	GroupContext []byte // Serialized GroupContext; required for TBS verification
+	// SenderRatchet bounds out-of-order tolerance (RFC 9420 §9.2). The zero
+	// value selects the secrettree defaults.
+	SenderRatchet secrettree.SenderRatchetConfig
 }
 
 // Decrypt decrypts a PrivateMessage and returns the AuthenticatedContent.
@@ -331,47 +334,41 @@ func Decrypt(pm *PrivateMessage, p DecryptParams) (*AuthenticatedContent, error)
 	if err != nil {
 		return nil, fmt.Errorf("framing: getting leaf secret: %w", err)
 	}
-	leaf.SetSequenceNumber(uint64(senderData.Generation))
+	// Keep the leaf's send counter monotonic: never rewind it to an older
+	// generation, which could reuse a key/nonce if this leaf is our own.
+	if next := uint64(senderData.Generation) + 1; next > leaf.SequenceNumber() {
+		leaf.SetSequenceNumber(next)
+	}
 
 	// Build PrivateContentAAD and decrypt content
 	aad := buildPrivateContentAAD(pm.GroupID, pm.Epoch, pm.ContentType, pm.AuthenticatedData)
 
+	// Key lookup never consumes: a late generation is served from the keys
+	// retained when the ratchet skipped it (bounded by p.SenderRatchet), and
+	// the key is deleted only after the AEAD open succeeds.
 	decryptWithRatchet := func(handshake bool) ([]byte, error) {
-		var key []byte
-		var nonce []byte
-		var err error
-		if handshake {
-			key, err = leaf.HandshakeKey(senderData.Generation)
-			if err != nil {
-				return nil, fmt.Errorf("framing: deriving handshake content key: %w", err)
+		key, nonce, err := leaf.DecryptionKeyNonce(senderData.Generation, handshake, p.SenderRatchet)
+		if err != nil {
+			ratchet := "application"
+			if handshake {
+				ratchet = "handshake"
 			}
-			nonce, err = leaf.HandshakeNonce(senderData.Generation)
-			if err != nil {
-				return nil, fmt.Errorf("framing: deriving handshake content nonce: %w", err)
-			}
-		} else {
-			key, err = leaf.ApplicationKey(senderData.Generation)
-			if err != nil {
-				return nil, fmt.Errorf("framing: deriving application content key: %w", err)
-			}
-			nonce, err = leaf.ApplicationNonce(senderData.Generation)
-			if err != nil {
-				return nil, fmt.Errorf("framing: deriving application content nonce: %w", err)
-			}
+			return nil, fmt.Errorf("framing: deriving %s content key: %w", ratchet, err)
 		}
-
 		for i := range ciphersuite.ReuseGuardBytes {
 			nonce[i] ^= senderData.ReuseGuard[i]
 		}
-
-		return ciphersuite.DecryptWithCipherSuite(key, nonce, pm.Ciphertext, aad, p.CipherSuite)
+		pt, err := ciphersuite.DecryptWithCipherSuite(key, nonce, pm.Ciphertext, aad, p.CipherSuite)
+		clear(key)
+		clear(nonce)
+		return pt, err
 	}
 
 	var plaintext []byte
-	if pm.ContentType == ContentTypeApplication {
+	isHandshake := pm.ContentType != ContentTypeApplication
+	if !isHandshake {
 		plaintext, err = decryptWithRatchet(false)
 	} else {
-		var pt []byte
 		pt, hsErr := decryptWithRatchet(true)
 		if hsErr == nil {
 			plaintext = pt
@@ -379,21 +376,20 @@ func Decrypt(pm *PrivateMessage, p DecryptParams) (*AuthenticatedContent, error)
 			pt, appErr := decryptWithRatchet(false)
 			if appErr == nil {
 				plaintext = pt
+				isHandshake = false
 			} else {
 				err = hsErr
 			}
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: content: %v", ErrDecryptionFailed, err)
+		return nil, fmt.Errorf("%w: content: %w", ErrDecryptionFailed, err)
 	}
 
-	// RFC 9420 §9.2: mark generation as consumed to reject replays.
-	// The handshake and application ratchets are independent (both start at gen 0),
-	// so their replay windows are tracked separately.
-	isHandshake := pm.ContentType != ContentTypeApplication
-	if replayErr := leaf.MarkGenerationUsed(senderData.Generation, isHandshake); replayErr != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDecryptionFailed, replayErr)
+	// RFC 9420 §9.2: delete the consumed key so a replay of this generation is
+	// rejected, including after the tree is persisted and restored.
+	if consumeErr := leaf.ConsumeGeneration(senderData.Generation, isHandshake); consumeErr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrDecryptionFailed, consumeErr)
 	}
 
 	// Parse body + auth from PrivateMessageContent

@@ -115,6 +115,9 @@ type Group struct {
 	// paddingSize controls the block size used to pad encrypted application
 	// messages (RFC 9420 §14). Zero disables padding.
 	paddingSize int
+	// senderRatchet bounds out-of-order tolerance for received PrivateMessages
+	// (RFC 9420 §9.2). The zero value selects the secrettree defaults.
+	senderRatchet secrettree.SenderRatchetConfig
 	// myLeafEncryptionKey is the private HPKE key of the own leaf, used for
 	// decrypting path secrets in received commits (RFC 9420 §12.4.2).
 	myLeafEncryptionKey []byte
@@ -228,6 +231,23 @@ func (g *Group) SetPaddingSize(size int) {
 		size = 0
 	}
 	g.paddingSize = size
+}
+
+// SetSenderRatchetConfig sets the out-of-order tolerance used when decrypting
+// PrivateMessages (RFC 9420 §9.2). The zero value selects the defaults.
+func (g *Group) SetSenderRatchetConfig(cfg secrettree.SenderRatchetConfig) {
+	if g == nil {
+		return
+	}
+	g.senderRatchet = cfg
+}
+
+// SenderRatchetConfig returns the out-of-order tolerance used when decrypting.
+func (g *Group) SenderRatchetConfig() secrettree.SenderRatchetConfig {
+	if g == nil {
+		return secrettree.SenderRatchetConfig{}
+	}
+	return g.senderRatchet
 }
 
 // ConfirmationTag returns the confirmation tag of the current epoch.
@@ -437,6 +457,9 @@ func (g *Group) cacheOldEpoch(
 	oldGroupContext *GroupContext,
 	oldCipherSuite ciphersuite.CipherSuite,
 ) {
+	// RFC 9420 §9.2: keys retained for out-of-order delivery belong to the
+	// epoch that just ended; delete them instead of carrying them forward.
+	oldSecretTree.PurgeRetainedKeys()
 	if oldEpochSecrets == nil {
 		return
 	}
@@ -2519,6 +2542,7 @@ func (g *Group) decryptPrivateMessage(pm *framing.PrivateMessage) (*framing.Auth
 		SecretTree:       g.secretTree,
 		SigPubKey:        nil,
 		GroupContext:     g.groupContext.Marshal(),
+		SenderRatchet:    g.senderRatchet,
 	})
 	if err != nil {
 		return nil, 0, err
